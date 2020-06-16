@@ -19,7 +19,7 @@ type Cache struct {
 
 	// Handles ensuring the expiry loop will actually die but can be resurrected.
 	loopKilled     bool
-	loopKilledLock *sync.Mutex
+	loopKilledLock *sync.RWMutex
 }
 
 // Defines a key in the cache.
@@ -115,16 +115,22 @@ func (c *Cache) revive(key interface{}) {
 // Ensures the loop is running. This is important if the cache has a lot of expired elements.
 func (c *Cache) ensureLoop() {
 	// Lock the loop kill lock. This isn't a RWMutex since that has the potential to add a race condition.
-	c.loopKilledLock.Lock()
+	c.loopKilledLock.RLock()
 
 	// If it was killed, run it again.
 	if c.loopKilled {
-		c.loopKilled = false
-		go c.purgeExpiredLoop()
+		c.loopKilledLock.RUnlock()
+		c.loopKilledLock.Lock()
+		if c.loopKilled {
+			// This is here to stop the potential for a race condition.
+			c.loopKilled = false
+			go c.purgeExpiredLoop()
+		}
+		c.loopKilledLock.Unlock()
+	} else {
+		// Re-unlock the boolean.
+		c.loopKilledLock.RUnlock()
 	}
-
-	// Re-unlock the boolean.
-	c.loopKilledLock.Unlock()
 }
 
 // Get is used to try and get a interface from the cache.
@@ -197,6 +203,6 @@ func NewCache(MaxLength int, Duration time.Duration) *Cache {
 		maxLen:         MaxLength,
 		duration:       Duration,
 		loopKilled:     true,
-		loopKilledLock: &sync.Mutex{},
+		loopKilledLock: &sync.RWMutex{},
 	}
 }
