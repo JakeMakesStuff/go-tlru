@@ -1,4 +1,4 @@
-package tlfu
+package tlru
 
 import (
 	"container/list"
