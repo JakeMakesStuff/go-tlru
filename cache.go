@@ -2,80 +2,38 @@ package tlru
 
 import (
 	"container/list"
+	"runtime"
 	"sync"
 	"time"
 )
 
+// Defines an item in the cache.
+type cacheItem struct {
+	item      interface{}
+	size	  int
+	destroyer *time.Timer
+}
+
+// Defines a key in the key list.
+type cacheKey struct {
+	key  interface{}
+	item *cacheItem
+}
+
 // Defines the cache and all required items.
 type Cache struct {
 	// Defines the attributes for the base cache.
-	m        *sync.RWMutex
+	m        *sync.Mutex
 	keyList  *list.List
-	valueMap map[interface{}]interface{}
+	valueMap map[interface{}]*cacheItem
 	maxLen   int
+	maxBytes int
+
+	// The total size of items in the cache.
+	totalBytes int
 
 	// Define the duration of an item in the cache.
 	duration time.Duration
-
-	// Handles ensuring the expiry loop will actually die but can be resurrected.
-	loopKilled     bool
-	loopKilledLock *sync.RWMutex
-}
-
-// Defines a key in the cache.
-type cacheKey struct {
-	key       interface{}
-	expiresAt time.Time
-}
-
-// Defines the loop used to purge expired items from the cache.
-func (c *Cache) purgeExpiredLoop() {
-	// Wait a millisecond before starting so that we are definitely behind times but not by much (prevents wastage).
-	time.Sleep(time.Millisecond)
-
-	for {
-		// Sleep for the specified duration.
-		time.Sleep(c.duration)
-
-		// Get the time right now.
-		t := time.Now().UTC()
-
-		// Lock the cache. This isn't a read lock since there is a high chance of eviction (or returning quickly).
-		c.m.Lock()
-
-		// Get the first element.
-		e := c.keyList.Front()
-
-		// Is the first element nil?
-		if e == nil {
-			// It is. Ok, this cache is empty so this loop shouldn't be running. Unlock and return.
-			c.m.Unlock()
-			return
-		}
-
-		// Loop through the cache.
-		for e != nil {
-			// Get the cache item.
-			item := e.Value.(cacheKey)
-
-			if !item.expiresAt.Before(t) {
-				// Ok. We do not need to purge anything further, we can break now.
-				break
-			}
-
-			// Remove from the list.
-			c.keyList.Remove(e)
-
-			// Remove from the value map.
-			delete(c.valueMap, item.key)
-
-			// Get the next item in the cache.
-			e = e.Next()
-		}
-
-		// Unlock the cache.
-		c.m.Unlock()
-	}
 }
 
 // Purge the first added item possible from the cache.
@@ -86,7 +44,9 @@ func (c *Cache) purgeFirst() {
 		return
 	}
 	c.keyList.Remove(f)
-	delete(c.valueMap, f.Value.(cacheKey).key)
+	c.totalBytes -= f.Value.(*cacheKey).item.size
+	f.Value.(*cacheKey).item.destroyer.Stop()
+	delete(c.valueMap, f.Value.(*cacheKey).key)
 }
 
 // Revives a key. This will reset its expiry and push it to the back of the list.
@@ -95,14 +55,16 @@ func (c *Cache) purgeFirst() {
 func (c *Cache) revive(key interface{}) {
 	e := c.keyList.Back()
 	push := func() {
-		c.keyList.PushBack(cacheKey{
-			key:       key,
-			expiresAt: time.Now().UTC().Add(c.duration),
+		value := c.valueMap[key]
+		c.keyList.PushBack(&cacheKey{
+			key:  key,
+			item: value,
 		})
+		value.destroyer.Reset(c.duration)
 	}
 	for e != nil {
-		k := e.Value.(cacheKey).key
-		if k == key {
+		k := e.Value.(*cacheKey)
+		if k.key == key {
 			c.keyList.Remove(e)
 			push()
 			return
@@ -112,97 +74,138 @@ func (c *Cache) revive(key interface{}) {
 	push()
 }
 
-// Ensures the loop is running. This is important if the cache has a lot of expired elements.
-func (c *Cache) ensureLoop() {
-	// Lock the loop kill lock. This isn't a RWMutex since that has the potential to add a race condition.
-	c.loopKilledLock.RLock()
-
-	// If it was killed, run it again.
-	if c.loopKilled {
-		c.loopKilledLock.RUnlock()
-		c.loopKilledLock.Lock()
-		if c.loopKilled {
-			// This is here to stop the potential for a race condition.
-			c.loopKilled = false
-			go c.purgeExpiredLoop()
-		}
-		c.loopKilledLock.Unlock()
-	} else {
-		// Re-unlock the boolean.
-		c.loopKilledLock.RUnlock()
-	}
-}
-
 // Get is used to try and get a interface from the cache.
 // The second boolean is meant to represent ok. If it's false, it was not in the cache.
 func (c *Cache) Get(Key interface{}) (item interface{}, ok bool) {
+	// Lock the mutex.
+	c.m.Lock()
+
 	// Try to get from the cache.
-	c.m.RLock()
 	x, ok := c.valueMap[Key]
-	c.m.RUnlock()
 
 	// If this isn't ok, we return here.
 	if !ok {
+		c.m.Unlock()
 		return nil, false
 	}
 
-	// Start a go-routine to revive the key in the cache and ensure the loop is running.
-	go func() {
-		c.ensureLoop()
-		c.m.Lock()
-		c.revive(Key)
-		c.m.Unlock()
-	}()
+	// Revive the key.
+	c.revive(Key)
+
+	// Unlock the mutex.
+	c.m.Unlock()
 
 	// Return the item.
-	return x, true
+	return x.item, true
+}
+
+// Used to generate a destruction function for a item.
+func (c *Cache) destroyItem(Key interface{}, timer bool) func() {
+	return func() {
+		// Lock the mutex.
+		c.m.Lock()
+
+		// Delete the item from the cache.
+		delete(c.valueMap, Key)
+		x := c.keyList.Back()
+		for x != nil {
+			ck := x.Value.(*cacheKey)
+			if ck.key == Key {
+				c.keyList.Remove(x)
+				if !timer {
+					ck.item.destroyer.Stop()
+				}
+				c.totalBytes -= ck.item.size
+				break
+			}
+			x.Prev()
+		}
+
+		// Unlock the mutex.
+		c.m.Unlock()
+	}
+}
+
+// Delete is used to delete an option from the cache.
+func (c *Cache) Delete(Key interface{}) {
+	c.destroyItem(Key, false)()
+}
+
+// Erase is used to erase the cache.
+func (c *Cache) Erase() {
+	c.m.Lock()
+	c.keyList = list.New()
+	for _, v := range c.valueMap {
+		v.destroyer.Stop()
+	}
+	c.valueMap = map[interface{}]*cacheItem{}
+	c.m.Unlock()
+	c.totalBytes = 0
+	runtime.GC()
 }
 
 // Set is used to set a key/value interface in the cache.
 func (c *Cache) Set(Key, Value interface{}) {
-	// Ensure the loop is running.
-	go c.ensureLoop()
-
-	// Read lock the cache and check if the key already exists and the length.
-	c.m.RLock()
-	_, exists := c.valueMap[Key]
-	l := len(c.valueMap)
-	c.m.RUnlock()
-
 	// Lock the mutex.
 	c.m.Lock()
 
-	// If the length is the max length, remove one.
-	if l == c.maxLen {
-		c.purgeFirst()
+	// Check if the key already exists and the length.
+	item, exists := c.valueMap[Key]
+
+	// Get the total size.
+	var total int
+	if c.maxBytes != 0 {
+		total = int(sizeof(Value))
+		if total > c.maxBytes {
+			// Don't cache this.
+			return
+		}
 	}
 
-	// If the key already exists, we should revive the key. If not, we should push it.
+	// If the key already exists, we should revive the key. If not, we should push it and set a timer in the map.
 	if exists {
 		c.revive(Key)
+		item.item = Value
 	} else {
-		c.keyList.PushBack(cacheKey{
-			key:       Key,
-			expiresAt: time.Now().UTC().Add(c.duration),
+		// If the length is the max length, remove one.
+		l := len(c.valueMap)
+		if l == c.maxLen && c.maxLen != 0 {
+			c.purgeFirst()
+		}
+
+		// Set the cache item.
+		item = &cacheItem{
+			item:      Value,
+			destroyer: time.AfterFunc(c.duration, c.destroyItem(Key, true)),
+			size: total,
+		}
+		c.keyList.PushBack(&cacheKey{
+			key:  Key,
+			item: item,
 		})
+		c.valueMap[Key] = item
+		c.totalBytes += total
 	}
 
-	// Set the item.
-	c.valueMap[Key] = Value
+	// Ensure max bytes is greater than or equal to total bytes.
+	for c.totalBytes > c.maxBytes {
+		// Purge the first item.
+		c.purgeFirst()
+	}
 
 	// Unlock the mutex.
 	c.m.Unlock()
 }
 
 // NewCache is used to create the cache.
-func NewCache(MaxLength int, Duration time.Duration) *Cache {
+// Setting MaxLength of MaxBytes to 0 will mean unlimited.
+func NewCache(MaxLength, MaxBytes int, Duration time.Duration) *Cache {
 	return &Cache{
-		m:              &sync.RWMutex{},
-		keyList:        list.New(),
-		valueMap:       map[interface{}]interface{}{},
-		maxLen:         MaxLength,
-		duration:       Duration,
-		loopKilled:     true,
-		loopKilledLock: &sync.RWMutex{},
+		m:        &sync.Mutex{},
+		keyList:  list.New(),
+		valueMap: map[interface{}]*cacheItem{},
+		maxLen:   MaxLength,
+		maxBytes: MaxBytes,
+		duration: Duration,
 	}
 }

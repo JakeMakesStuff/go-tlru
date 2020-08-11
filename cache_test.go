@@ -7,7 +7,7 @@ import (
 )
 
 func TestCacheGetSet(t *testing.T) {
-	c := NewCache(1, time.Second)
+	c := NewCache(1, 0, time.Second)
 	c.Set("a", true)
 	r, ok := c.Get("a")
 	if !ok {
@@ -19,8 +19,30 @@ func TestCacheGetSet(t *testing.T) {
 	}
 }
 
+func TestCacheMemoryEviction(t *testing.T) {
+	c := NewCache(10, 1, time.Millisecond*3)
+	c.Set("a", true)
+	_, ok := c.Get("a")
+	if !ok {
+		t.Fatal("should be ok")
+	}
+	c.Set("b", true)
+	_, ok = c.Get("b")
+	if !ok {
+		t.Fatal("should be ok")
+	}
+	_, ok = c.Get("a")
+	if ok {
+		t.Fatal("should be not ok")
+	}
+	time.Sleep(time.Millisecond*5)
+	if c.totalBytes != 0 {
+		t.Fatal("total bytes hasn't reset")
+	}
+}
+
 func TestCacheNoItemFound(t *testing.T) {
-	c := NewCache(1, time.Second)
+	c := NewCache(1, 0, time.Second)
 	c.Set("a", true)
 	_, ok := c.Get("b")
 	if ok {
@@ -29,7 +51,7 @@ func TestCacheNoItemFound(t *testing.T) {
 }
 
 func TestCacheExpiry(t *testing.T) {
-	c := NewCache(1, time.Millisecond)
+	c := NewCache(1, 0, time.Millisecond)
 	c.Set("a", true)
 	time.Sleep(time.Millisecond * 3)
 	_, ok := c.Get("a")
@@ -39,7 +61,7 @@ func TestCacheExpiry(t *testing.T) {
 }
 
 func TestCacheFilling(t *testing.T) {
-	c := NewCache(1, time.Second)
+	c := NewCache(1, 0, time.Second)
 	c.Set("a", true)
 	c.Set("b", true)
 	_, ok := c.Get("a")
@@ -58,7 +80,7 @@ func TestCacheFilling(t *testing.T) {
 }
 
 func TestCacheRaceConditionsGetSet(t *testing.T) {
-	c := NewCache(2, time.Second)
+	c := NewCache(2, 0, time.Second)
 	for i := 0; i < 100000; i++ {
 		go func(index int) {
 			c.Set(1, 1)
@@ -69,13 +91,13 @@ func TestCacheRaceConditionsGetSet(t *testing.T) {
 }
 
 func BenchmarkCache_Get50000Eviction(b *testing.B) {
-	c := NewCache(10000, time.Millisecond*5)
+	c := NewCache(10000, 0, time.Second*5)
 	wg := sync.WaitGroup{}
 	wg.Add(9999)
 	for i := 0; i < 9999; i++ {
 		go func(index int) {
-			defer wg.Done()
 			c.Set(index, 1)
+			wg.Done()
 		}(i)
 	}
 	wg.Wait()
@@ -92,7 +114,7 @@ func BenchmarkCache_Get50000Eviction(b *testing.B) {
 }
 
 func BenchmarkCache_SetIdeal(b *testing.B) {
-	c := NewCache(10000, time.Second)
+	c := NewCache(10000, 0, time.Second)
 	wg := sync.WaitGroup{}
 	wg.Add(9999)
 	for i := 0; i < 9999; i++ {
@@ -107,7 +129,7 @@ func BenchmarkCache_SetIdeal(b *testing.B) {
 }
 
 func BenchmarkCache_SetUnideal(b *testing.B) {
-	c := NewCache(10000, time.Second)
+	c := NewCache(10000, 0, time.Second)
 	wg := sync.WaitGroup{}
 	wg.Add(5000)
 	for i := 0; i < 5000; i++ {
