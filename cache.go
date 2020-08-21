@@ -23,7 +23,7 @@ type cacheKey struct {
 // Defines the cache and all required items.
 type Cache struct {
 	// Defines the attributes for the base cache.
-	m        *sync.Mutex
+	m        sync.Mutex
 	keyList  *list.List
 	valueMap map[interface{}]*cacheItem
 	maxLen   int
@@ -158,6 +158,7 @@ func (c *Cache) Set(Key, Value interface{}) {
 		total = int(sizeof(Value))
 		if total > c.maxBytes {
 			// Don't cache this.
+			c.m.Unlock()
 			return
 		}
 	}
@@ -201,7 +202,6 @@ func (c *Cache) Set(Key, Value interface{}) {
 // Setting MaxLength of MaxBytes to 0 will mean unlimited.
 func NewCache(MaxLength, MaxBytes int, Duration time.Duration) *Cache {
 	return &Cache{
-		m:        &sync.Mutex{},
 		keyList:  list.New(),
 		valueMap: map[interface{}]*cacheItem{},
 		maxLen:   MaxLength,
