@@ -10,14 +10,9 @@ import (
 // Defines an item in the cache.
 type cacheItem struct {
 	item      interface{}
-	size	  int
+	size      int
 	destroyer *time.Timer
-}
-
-// Defines a key in the key list.
-type cacheKey struct {
-	key  interface{}
-	item *cacheItem
+	element   *list.Element
 }
 
 // Defines the cache and all required items.
@@ -44,34 +39,10 @@ func (c *Cache) purgeFirst() {
 		return
 	}
 	c.keyList.Remove(f)
-	c.totalBytes -= f.Value.(*cacheKey).item.size
-	f.Value.(*cacheKey).item.destroyer.Stop()
-	delete(c.valueMap, f.Value.(*cacheKey).key)
-}
-
-// Revives a key. This will reset its expiry and push it to the back of the list.
-// We do this from the back of the list since if it's just being fetched, it's more likely to be new.
-// THIS FUNCTION IS NOT THREAD SAFE FOR PERFORMANCE REASONS (DOUBLE LOCKING)! BE CAREFUL!
-func (c *Cache) revive(key interface{}) {
-	e := c.keyList.Back()
-	push := func() {
-		value := c.valueMap[key]
-		c.keyList.PushBack(&cacheKey{
-			key:  key,
-			item: value,
-		})
-		value.destroyer.Reset(c.duration)
-	}
-	for e != nil {
-		k := e.Value.(*cacheKey)
-		if k.key == key {
-			c.keyList.Remove(e)
-			push()
-			return
-		}
-		e = e.Prev()
-	}
-	push()
+	item := c.valueMap[f.Value]
+	c.totalBytes -= item.size
+	item.destroyer.Stop()
+	delete(c.valueMap, f.Value)
 }
 
 // Get is used to try and get a interface from the cache.
@@ -90,7 +61,9 @@ func (c *Cache) Get(Key interface{}) (item interface{}, ok bool) {
 	}
 
 	// Revive the key.
-	c.revive(Key)
+	c.keyList.Remove(x.element)
+	x.element = c.keyList.PushBack(Key)
+	x.destroyer.Reset(c.duration)
 
 	// Unlock the mutex.
 	c.m.Unlock()
@@ -106,20 +79,13 @@ func (c *Cache) destroyItem(Key interface{}, timer bool) func() {
 		c.m.Lock()
 
 		// Delete the item from the cache.
+		item := c.valueMap[Key]
+		c.keyList.Remove(item.element)
 		delete(c.valueMap, Key)
-		x := c.keyList.Back()
-		for x != nil {
-			ck := x.Value.(*cacheKey)
-			if ck.key == Key {
-				c.keyList.Remove(x)
-				if !timer {
-					ck.item.destroyer.Stop()
-				}
-				c.totalBytes -= ck.item.size
-				break
-			}
-			x.Prev()
+		if !timer {
+			item.destroyer.Stop()
 		}
+		c.totalBytes -= item.size
 
 		// Unlock the mutex.
 		c.m.Unlock()
@@ -165,7 +131,9 @@ func (c *Cache) Set(Key, Value interface{}) {
 
 	// If the key already exists, we should revive the key. If not, we should push it and set a timer in the map.
 	if exists {
-		c.revive(Key)
+		c.keyList.Remove(item.element)
+		item.element = c.keyList.PushBack(Key)
+		item.destroyer.Reset(c.duration)
 		item.item = Value
 	} else {
 		// If the length is the max length, remove one.
@@ -175,15 +143,13 @@ func (c *Cache) Set(Key, Value interface{}) {
 		}
 
 		// Set the cache item.
+		el := c.keyList.PushBack(Key)
 		item = &cacheItem{
 			item:      Value,
 			destroyer: time.AfterFunc(c.duration, c.destroyItem(Key, true)),
-			size: total,
+			size:      total,
+			element:   el,
 		}
-		c.keyList.PushBack(&cacheKey{
-			key:  Key,
-			item: item,
-		})
 		c.valueMap[Key] = item
 		c.totalBytes += total
 	}

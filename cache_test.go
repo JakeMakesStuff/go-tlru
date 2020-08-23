@@ -35,7 +35,7 @@ func TestCacheMemoryEviction(t *testing.T) {
 	if ok {
 		t.Fatal("should be not ok")
 	}
-	time.Sleep(time.Millisecond*5)
+	time.Sleep(time.Millisecond * 5)
 	if c.totalBytes != 0 {
 		t.Fatal("total bytes hasn't reset")
 	}
