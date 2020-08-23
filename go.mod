@@ -1,3 +1,3 @@
-module github.com/jakemakesstuff/go-tlru
+module github.com/auttaja/go-tlru
 
 go 1.14
